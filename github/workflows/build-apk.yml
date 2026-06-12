@@ -1,0 +1,957 @@
+name: 手机一键构建安卓 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 生成安卓项目源码
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$(dirname 'settings.gradle')"
+          cat > 'settings.gradle' <<'EOF_settings_gradle'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          
+          rootProject.name = "TimerAlarmNative"
+          include ":app"
+          EOF_settings_gradle
+
+          mkdir -p "$(dirname 'build.gradle')"
+          cat > 'build.gradle' <<'EOF_build_gradle'
+          plugins {
+              id "com.android.application" version "8.5.2" apply false
+          }
+          EOF_build_gradle
+
+          mkdir -p "$(dirname 'app/build.gradle')"
+          cat > 'app/build.gradle' <<'EOF_app_build_gradle'
+          plugins {
+              id "com.android.application"
+          }
+          
+          android {
+              namespace "com.trae.timeralarm"
+              compileSdk 35
+          
+              defaultConfig {
+                  applicationId "com.trae.timeralarm"
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          EOF_app_build_gradle
+
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_app_src_main_AndroidManifest_xml'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+          
+              <application
+                  android:allowBackup="true"
+                  android:theme="@style/AppTheme"
+                  android:label="计时器"
+                  android:resizeableActivity="true"
+                  android:supportsRtl="true">
+          
+                  <activity
+                      android:name=".AlarmActivity"
+                      android:exported="false"
+                      android:showWhenLocked="true"
+                      android:turnScreenOn="true"
+                      android:excludeFromRecents="true" />
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+          
+                  <receiver
+                      android:name=".AlarmReceiver"
+                      android:exported="false" />
+          
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:enabled="true"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF_app_src_main_AndroidManifest_xml
+
+          mkdir -p "$(dirname 'app/src/main/res/values/styles.xml')"
+          cat > 'app/src/main/res/values/styles.xml' <<'EOF_app_src_main_res_values_styles_xml'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:statusBarColor">#070A12</item>
+                  <item name="android:navigationBarColor">#070A12</item>
+                  <item name="android:colorAccent">#38BDF8</item>
+              </style>
+          </resources>
+          EOF_app_src_main_res_values_styles_xml
+
+          mkdir -p "$(dirname 'app/src/main/java/com/trae/timeralarm/AlarmScheduler.java')"
+          cat > 'app/src/main/java/com/trae/timeralarm/AlarmScheduler.java' <<'EOF_app_src_main_java_com_trae_timeralarm_AlarmScheduler_java'
+          package com.trae.timeralarm;
+          
+          import android.app.AlarmManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.provider.Settings;
+          
+          import java.util.Calendar;
+          
+          public class AlarmScheduler {
+              public static final String PREF = "timer_alarm_pref";
+          
+              public static long nextTimestamp(int hour, int minute) {
+                  Calendar now = Calendar.getInstance();
+                  Calendar target = Calendar.getInstance();
+                  target.set(Calendar.HOUR_OF_DAY, hour);
+                  target.set(Calendar.MINUTE, minute);
+                  target.set(Calendar.SECOND, 0);
+                  target.set(Calendar.MILLISECOND, 0);
+                  if (target.getTimeInMillis() <= now.getTimeInMillis()) {
+                      target.add(Calendar.DAY_OF_YEAR, 1);
+                  }
+                  return target.getTimeInMillis();
+              }
+          
+              public static void schedule(Context context) {
+                  SharedPreferences pref = context.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+                  boolean enabled = pref.getBoolean("alarmEnabled", false);
+                  if (!enabled) {
+                      cancel(context);
+                      return;
+                  }
+          
+                  int hour = pref.getInt("alarmHour", 7);
+                  int minute = pref.getInt("alarmMinute", 0);
+                  long triggerAt = nextTimestamp(hour, minute);
+                  pref.edit().putLong("nextDueAt", triggerAt).apply();
+          
+                  AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+                  if (alarmManager == null) return;
+          
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) {
+                      Intent intent = new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM);
+                      intent.setData(Uri.parse("package:" + context.getPackageName()));
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      context.startActivity(intent);
+                      return;
+                  }
+          
+                  PendingIntent operation = PendingIntent.getBroadcast(
+                          context,
+                          1001,
+                          new Intent(context, AlarmReceiver.class),
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+          
+                  PendingIntent showIntent = PendingIntent.getActivity(
+                          context,
+                          1002,
+                          new Intent(context, AlarmActivity.class),
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+          
+                  AlarmManager.AlarmClockInfo info = new AlarmManager.AlarmClockInfo(triggerAt, showIntent);
+                  alarmManager.setAlarmClock(info, operation);
+              }
+          
+              public static void cancel(Context context) {
+                  AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+                  if (alarmManager == null) return;
+                  PendingIntent operation = PendingIntent.getBroadcast(
+                          context,
+                          1001,
+                          new Intent(context, AlarmReceiver.class),
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+                  alarmManager.cancel(operation);
+              }
+          }
+          EOF_app_src_main_java_com_trae_timeralarm_AlarmScheduler_java
+
+          mkdir -p "$(dirname 'app/src/main/java/com/trae/timeralarm/AlarmReceiver.java')"
+          cat > 'app/src/main/java/com/trae/timeralarm/AlarmReceiver.java' <<'EOF_app_src_main_java_com_trae_timeralarm_AlarmReceiver_java'
+          package com.trae.timeralarm;
+          
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          
+          public class AlarmReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  SharedPreferences pref = context.getSharedPreferences(AlarmScheduler.PREF, Context.MODE_PRIVATE);
+                  boolean repeatDaily = pref.getBoolean("alarmRepeatDaily", false);
+          
+                  Intent alarmIntent = new Intent(context, AlarmActivity.class);
+                  alarmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  context.startActivity(alarmIntent);
+          
+                  if (repeatDaily) {
+                      AlarmScheduler.schedule(context);
+                  } else {
+                      pref.edit().putBoolean("alarmEnabled", false).putLong("nextDueAt", 0).apply();
+                  }
+              }
+          }
+          EOF_app_src_main_java_com_trae_timeralarm_AlarmReceiver_java
+
+          mkdir -p "$(dirname 'app/src/main/java/com/trae/timeralarm/BootReceiver.java')"
+          cat > 'app/src/main/java/com/trae/timeralarm/BootReceiver.java' <<'EOF_app_src_main_java_com_trae_timeralarm_BootReceiver_java'
+          package com.trae.timeralarm;
+          
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          
+          public class BootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  if (!Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) return;
+                  SharedPreferences pref = context.getSharedPreferences(AlarmScheduler.PREF, Context.MODE_PRIVATE);
+                  if (pref.getBoolean("alarmEnabled", false)) {
+                      AlarmScheduler.schedule(context);
+                  }
+              }
+          }
+          EOF_app_src_main_java_com_trae_timeralarm_BootReceiver_java
+
+          mkdir -p "$(dirname 'app/src/main/java/com/trae/timeralarm/MainActivity.java')"
+          cat > 'app/src/main/java/com/trae/timeralarm/MainActivity.java' <<'EOF_app_src_main_java_com_trae_timeralarm_MainActivity_java'
+          package com.trae.timeralarm;
+          
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.SystemClock;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.CompoundButton;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.TimePicker;
+          
+          public class MainActivity extends Activity {
+              private static final int PICK_AUDIO = 2001;
+              private final Handler handler = new Handler();
+              private SharedPreferences pref;
+          
+              private TextView title;
+              private TextView display;
+              private Button stopwatchTab;
+              private Button countdownTab;
+              private Button startPause;
+              private Button reset;
+              private EditText minutesInput;
+              private EditText secondsInput;
+              private LinearLayout countdownEditor;
+              private TextView alarmInfo;
+              private TimePicker alarmTimePicker;
+              private CheckBox alarmEnabled;
+              private CheckBox alarmRepeatDaily;
+              private EditText alarmRepeatCount;
+              private TextView soundName;
+          
+              private String mode = "stopwatch";
+              private boolean stopwatchRunning = false;
+              private long stopwatchElapsed = 0;
+              private long stopwatchStartedAt = 0;
+          
+              private boolean countdownRunning = false;
+              private long countdownDuration = 5 * 60 * 1000L;
+              private long countdownElapsed = 0;
+              private long countdownStartedAt = 0;
+          
+              private final Runnable tick = new Runnable() {
+                  @Override
+                  public void run() {
+                      updateDisplay();
+                      handler.postDelayed(this, 200);
+                  }
+              };
+          
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  pref = getSharedPreferences(AlarmScheduler.PREF, MODE_PRIVATE);
+                  requestBasicPermissions();
+                  restoreTimers();
+                  buildUi();
+                  restoreAlarmUi();
+                  handler.post(tick);
+              }
+          
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  saveTimers();
+              }
+          
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  saveTimers();
+                  handler.removeCallbacks(tick);
+              }
+          
+              private void requestBasicPermissions() {
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 10);
+                  }
+              }
+          
+              private void buildUi() {
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(Color.rgb(7, 10, 18));
+          
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(28, 36, 28, 36);
+                  scroll.addView(root);
+          
+                  title = text("计时器", 34, Color.WHITE);
+                  title.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.addView(title);
+          
+                  LinearLayout tabs = row();
+                  stopwatchTab = button("正计时");
+                  countdownTab = button("倒计时");
+                  tabs.addView(stopwatchTab, weight());
+                  tabs.addView(countdownTab, weight());
+                  root.addView(tabs);
+          
+                  display = text("00:00.0", 56, Color.WHITE);
+                  display.setGravity(Gravity.CENTER);
+                  display.setPadding(0, 40, 0, 26);
+                  root.addView(display);
+          
+                  countdownEditor = row();
+                  minutesInput = input("5");
+                  secondsInput = input("0");
+                  Button setCountdown = button("设定");
+                  countdownEditor.addView(labelWrap("分钟", minutesInput), weight());
+                  countdownEditor.addView(labelWrap("秒", secondsInput), weight());
+                  countdownEditor.addView(setCountdown, weight());
+                  root.addView(countdownEditor);
+          
+                  LinearLayout controls = row();
+                  startPause = button("开始");
+                  reset = button("重置");
+                  controls.addView(startPause, weight());
+                  controls.addView(reset, weight());
+                  root.addView(controls);
+          
+                  addQuickButtons(root);
+                  addAlarmSection(root);
+          
+                  stopwatchTab.setOnClickListener(v -> {
+                      mode = "stopwatch";
+                      updateDisplay();
+                      saveTimers();
+                  });
+                  countdownTab.setOnClickListener(v -> {
+                      mode = "countdown";
+                      updateDisplay();
+                      saveTimers();
+                  });
+                  setCountdown.setOnClickListener(v -> setCountdownDurationFromInput());
+                  startPause.setOnClickListener(v -> toggleActiveTimer());
+                  reset.setOnClickListener(v -> resetActiveTimer());
+          
+                  setContentView(scroll);
+                  updateDisplay();
+              }
+          
+              private void addQuickButtons(LinearLayout root) {
+                  root.addView(sectionTitle("快速倒计时"));
+                  LinearLayout row1 = row();
+                  row1.addView(quickButton("1 分钟", 1), weight());
+                  row1.addView(quickButton("3 分钟", 3), weight());
+                  root.addView(row1);
+                  LinearLayout row2 = row();
+                  row2.addView(quickButton("5 分钟", 5), weight());
+                  row2.addView(quickButton("10 分钟", 10), weight());
+                  root.addView(row2);
+              }
+          
+              private void addAlarmSection(LinearLayout root) {
+                  root.addView(sectionTitle("闹钟"));
+                  alarmEnabled = new CheckBox(this);
+                  alarmEnabled.setText("开启闹钟");
+                  alarmEnabled.setTextColor(Color.WHITE);
+                  alarmEnabled.setTextSize(18);
+                  root.addView(alarmEnabled);
+          
+                  alarmTimePicker = new TimePicker(this);
+                  alarmTimePicker.setIs24HourView(true);
+                  root.addView(alarmTimePicker);
+          
+                  alarmRepeatDaily = new CheckBox(this);
+                  alarmRepeatDaily.setText("每天循环");
+                  alarmRepeatDaily.setTextColor(Color.WHITE);
+                  alarmRepeatDaily.setTextSize(18);
+                  root.addView(alarmRepeatDaily);
+          
+                  alarmRepeatCount = input("3");
+                  root.addView(labelWrap("提醒次数（每次响 5 分钟，间隔 1 分钟）", alarmRepeatCount));
+          
+                  soundName = text("铃声：默认系统闹钟音", 15, Color.LTGRAY);
+                  root.addView(soundName);
+                  LinearLayout soundRow = row();
+                  Button choose = button("选择音乐文件");
+                  Button test = button("试听");
+                  soundRow.addView(choose, weight());
+                  soundRow.addView(test, weight());
+                  root.addView(soundRow);
+          
+                  alarmInfo = text("闹钟未开启", 15, Color.rgb(52, 211, 153));
+                  root.addView(alarmInfo);
+          
+                  CompoundButton.OnCheckedChangeListener saveListener = (buttonView, isChecked) -> saveAndScheduleAlarm();
+                  alarmEnabled.setOnCheckedChangeListener(saveListener);
+                  alarmRepeatDaily.setOnCheckedChangeListener(saveListener);
+                  alarmTimePicker.setOnTimeChangedListener((view, hourOfDay, minute) -> saveAndScheduleAlarm());
+                  alarmRepeatCount.setOnFocusChangeListener((v, hasFocus) -> {
+                      if (!hasFocus) saveAndScheduleAlarm();
+                  });
+                  choose.setOnClickListener(v -> chooseAudio());
+                  test.setOnClickListener(v -> {
+                      Intent intent = new Intent(this, AlarmActivity.class);
+                      intent.putExtra("test", true);
+                      startActivity(intent);
+                  });
+              }
+          
+              private Button quickButton(String label, int minutes) {
+                  Button btn = button(label);
+                  btn.setOnClickListener(v -> {
+                      mode = "countdown";
+                      minutesInput.setText(String.valueOf(minutes));
+                      secondsInput.setText("0");
+                      setCountdownDuration(minutes * 60 * 1000L);
+                  });
+                  return btn;
+              }
+          
+              private void setCountdownDurationFromInput() {
+                  int minutes = parseInt(minutesInput.getText().toString(), 0);
+                  int seconds = parseInt(secondsInput.getText().toString(), 0);
+                  seconds = Math.min(59, Math.max(0, seconds));
+                  long duration = Math.max(1000L, (minutes * 60L + seconds) * 1000L);
+                  setCountdownDuration(duration);
+              }
+          
+              private void setCountdownDuration(long duration) {
+                  countdownDuration = duration;
+                  countdownElapsed = 0;
+                  countdownRunning = false;
+                  mode = "countdown";
+                  updateDisplay();
+                  saveTimers();
+              }
+          
+              private void toggleActiveTimer() {
+                  if ("stopwatch".equals(mode)) {
+                      if (stopwatchRunning) {
+                          stopwatchElapsed = getStopwatchElapsed();
+                          stopwatchRunning = false;
+                      } else {
+                          stopwatchRunning = true;
+                          stopwatchStartedAt = SystemClock.elapsedRealtime();
+                      }
+                  } else {
+                      if (countdownRunning) {
+                          countdownElapsed = getCountdownElapsed();
+                          countdownRunning = false;
+                      } else {
+                          if (getCountdownRemaining() <= 0) countdownElapsed = 0;
+                          countdownRunning = true;
+                          countdownStartedAt = SystemClock.elapsedRealtime();
+                      }
+                  }
+                  updateDisplay();
+                  saveTimers();
+              }
+          
+              private void resetActiveTimer() {
+                  if ("stopwatch".equals(mode)) {
+                      stopwatchRunning = false;
+                      stopwatchElapsed = 0;
+                  } else {
+                      countdownRunning = false;
+                      countdownElapsed = 0;
+                  }
+                  updateDisplay();
+                  saveTimers();
+              }
+          
+              private long getStopwatchElapsed() {
+                  return stopwatchRunning ? stopwatchElapsed + SystemClock.elapsedRealtime() - stopwatchStartedAt : stopwatchElapsed;
+              }
+          
+              private long getCountdownElapsed() {
+                  return countdownRunning ? Math.min(countdownDuration, countdownElapsed + SystemClock.elapsedRealtime() - countdownStartedAt) : countdownElapsed;
+              }
+          
+              private long getCountdownRemaining() {
+                  return Math.max(0, countdownDuration - getCountdownElapsed());
+              }
+          
+              private void updateDisplay() {
+                  if (countdownRunning && getCountdownRemaining() <= 0) {
+                      countdownRunning = false;
+                      countdownElapsed = countdownDuration;
+                  }
+          
+                  boolean stopwatchMode = "stopwatch".equals(mode);
+                  stopwatchTab.setAlpha(stopwatchMode ? 1f : 0.55f);
+                  countdownTab.setAlpha(stopwatchMode ? 0.55f : 1f);
+                  countdownEditor.setVisibility(stopwatchMode ? View.GONE : View.VISIBLE);
+          
+                  if (stopwatchMode) {
+                      display.setText(format(getStopwatchElapsed()));
+                      startPause.setText(stopwatchRunning ? "暂停" : getStopwatchElapsed() > 0 ? "继续" : "开始");
+                  } else {
+                      display.setText(format(getCountdownRemaining()));
+                      startPause.setText(countdownRunning ? "暂停" : getCountdownElapsed() > 0 && getCountdownRemaining() > 0 ? "继续" : "开始");
+                  }
+              }
+          
+              private String format(long ms) {
+                  long tenths = Math.max(0, ms) / 100;
+                  long tenth = tenths % 10;
+                  long totalSeconds = tenths / 10;
+                  long seconds = totalSeconds % 60;
+                  long minutes = totalSeconds / 60;
+                  return String.format("%02d:%02d.%d", minutes, seconds, tenth);
+              }
+          
+              private void restoreTimers() {
+                  mode = pref.getString("mode", "stopwatch");
+                  stopwatchElapsed = pref.getLong("stopwatchElapsed", 0);
+                  stopwatchRunning = pref.getBoolean("stopwatchRunning", false);
+                  long savedAt = pref.getLong("savedElapsedRealtime", SystemClock.elapsedRealtime());
+                  long delta = SystemClock.elapsedRealtime() - savedAt;
+                  if (stopwatchRunning) {
+                      stopwatchElapsed += Math.max(0, delta);
+                      stopwatchStartedAt = SystemClock.elapsedRealtime();
+                  }
+          
+                  countdownDuration = pref.getLong("countdownDuration", 5 * 60 * 1000L);
+                  countdownElapsed = pref.getLong("countdownElapsed", 0);
+                  countdownRunning = pref.getBoolean("countdownRunning", false);
+                  if (countdownRunning) {
+                      countdownElapsed = Math.min(countdownDuration, countdownElapsed + Math.max(0, delta));
+                      if (countdownElapsed >= countdownDuration) countdownRunning = false;
+                      countdownStartedAt = SystemClock.elapsedRealtime();
+                  }
+              }
+          
+              private void saveTimers() {
+                  pref.edit()
+                          .putString("mode", mode)
+                          .putLong("stopwatchElapsed", getStopwatchElapsed())
+                          .putBoolean("stopwatchRunning", stopwatchRunning)
+                          .putLong("countdownDuration", countdownDuration)
+                          .putLong("countdownElapsed", getCountdownElapsed())
+                          .putBoolean("countdownRunning", countdownRunning)
+                          .putLong("savedElapsedRealtime", SystemClock.elapsedRealtime())
+                          .apply();
+              }
+          
+              private void restoreAlarmUi() {
+                  alarmEnabled.setChecked(pref.getBoolean("alarmEnabled", false));
+                  alarmRepeatDaily.setChecked(pref.getBoolean("alarmRepeatDaily", false));
+                  int hour = pref.getInt("alarmHour", 7);
+                  int minute = pref.getInt("alarmMinute", 0);
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      alarmTimePicker.setHour(hour);
+                      alarmTimePicker.setMinute(minute);
+                  } else {
+                      alarmTimePicker.setCurrentHour(hour);
+                      alarmTimePicker.setCurrentMinute(minute);
+                  }
+                  alarmRepeatCount.setText(String.valueOf(pref.getInt("alarmRepeatCount", 3)));
+                  String uri = pref.getString("alarmSoundUri", "");
+                  soundName.setText(uri.isEmpty() ? "铃声：默认系统闹钟音" : "铃声：已选择自定义音乐");
+                  updateAlarmInfo();
+              }
+          
+              private void saveAndScheduleAlarm() {
+                  int hour = Build.VERSION.SDK_INT >= 23 ? alarmTimePicker.getHour() : alarmTimePicker.getCurrentHour();
+                  int minute = Build.VERSION.SDK_INT >= 23 ? alarmTimePicker.getMinute() : alarmTimePicker.getCurrentMinute();
+                  int repeats = Math.max(1, Math.min(10, parseInt(alarmRepeatCount.getText().toString(), 3)));
+                  alarmRepeatCount.setText(String.valueOf(repeats));
+                  pref.edit()
+                          .putBoolean("alarmEnabled", alarmEnabled.isChecked())
+                          .putBoolean("alarmRepeatDaily", alarmRepeatDaily.isChecked())
+                          .putInt("alarmHour", hour)
+                          .putInt("alarmMinute", minute)
+                          .putInt("alarmRepeatCount", repeats)
+                          .apply();
+                  if (alarmEnabled.isChecked()) {
+                      AlarmScheduler.schedule(this);
+                  } else {
+                      AlarmScheduler.cancel(this);
+                  }
+                  updateAlarmInfo();
+              }
+          
+              private void updateAlarmInfo() {
+                  if (!pref.getBoolean("alarmEnabled", false)) {
+                      alarmInfo.setText("闹钟未开启");
+                      return;
+                  }
+                  long next = pref.getLong("nextDueAt", 0);
+                  alarmInfo.setText(next > 0 ? "闹钟已开启，下次响铃时间已交给系统闹钟调度" : "闹钟已开启");
+              }
+          
+              private void chooseAudio() {
+                  Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                  intent.addCategory(Intent.CATEGORY_OPENABLE);
+                  intent.setType("audio/*");
+                  startActivityForResult(intent, PICK_AUDIO);
+              }
+          
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == PICK_AUDIO && resultCode == RESULT_OK && data != null && data.getData() != null) {
+                      Uri uri = data.getData();
+                      getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      pref.edit().putString("alarmSoundUri", uri.toString()).apply();
+                      soundName.setText("铃声：已选择自定义音乐");
+                  }
+              }
+          
+              private TextView text(String value, int sp, int color) {
+                  TextView tv = new TextView(this);
+                  tv.setText(value);
+                  tv.setTextSize(sp);
+                  tv.setTextColor(color);
+                  tv.setPadding(0, 12, 0, 12);
+                  return tv;
+              }
+          
+              private TextView sectionTitle(String value) {
+                  TextView tv = text(value, 22, Color.WHITE);
+                  tv.setPadding(0, 34, 0, 12);
+                  return tv;
+              }
+          
+              private Button button(String value) {
+                  Button b = new Button(this);
+                  b.setText(value);
+                  b.setTextSize(16);
+                  b.setAllCaps(false);
+                  return b;
+              }
+          
+              private EditText input(String value) {
+                  EditText e = new EditText(this);
+                  e.setText(value);
+                  e.setTextColor(Color.WHITE);
+                  e.setTextSize(18);
+                  e.setSelectAllOnFocus(true);
+                  e.setGravity(Gravity.CENTER);
+                  return e;
+              }
+          
+              private LinearLayout row() {
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER);
+                  row.setPadding(0, 8, 0, 8);
+                  return row;
+              }
+          
+              private LinearLayout labelWrap(String label, View child) {
+                  LinearLayout wrap = new LinearLayout(this);
+                  wrap.setOrientation(LinearLayout.VERTICAL);
+                  TextView tv = text(label, 14, Color.LTGRAY);
+                  wrap.addView(tv);
+                  wrap.addView(child);
+                  return wrap;
+              }
+          
+              private LinearLayout.LayoutParams weight() {
+                  return new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+              }
+          
+              private int parseInt(String text, int fallback) {
+                  try {
+                      return Integer.parseInt(text.trim());
+                  } catch (Exception e) {
+                      return fallback;
+                  }
+              }
+          }
+          EOF_app_src_main_java_com_trae_timeralarm_MainActivity_java
+
+          mkdir -p "$(dirname 'app/src/main/java/com/trae/timeralarm/AlarmActivity.java')"
+          cat > 'app/src/main/java/com/trae/timeralarm/AlarmActivity.java' <<'EOF_app_src_main_java_com_trae_timeralarm_AlarmActivity_java'
+          package com.trae.timeralarm;
+          
+          import android.app.Activity;
+          import android.content.SharedPreferences;
+          import android.media.AudioAttributes;
+          import android.media.MediaPlayer;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.PowerManager;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          
+          public class AlarmActivity extends Activity {
+              private final Handler handler = new Handler();
+              private MediaPlayer player;
+              private PowerManager.WakeLock wakeLock;
+              private int round = 0;
+              private int totalRounds = 1;
+              private boolean testMode = false;
+              private TextView title;
+              private TextView roundText;
+          
+              private final Runnable stopOneRound = new Runnable() {
+                  @Override
+                  public void run() {
+                      stopSound();
+                      if (round >= totalRounds) {
+                          finish();
+                          return;
+                      }
+                      roundText.setText("间隔 1 分钟后继续提醒");
+                      handler.postDelayed(startNextRound, 60 * 1000L);
+                  }
+              };
+          
+              private final Runnable startNextRound = new Runnable() {
+                  @Override
+                  public void run() {
+                      startRound();
+                  }
+              };
+          
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  testMode = getIntent().getBooleanExtra("test", false);
+                  prepareWindow();
+                  acquireWakeLock();
+                  buildUi();
+                  SharedPreferences pref = getSharedPreferences(AlarmScheduler.PREF, MODE_PRIVATE);
+                  totalRounds = testMode ? 1 : Math.max(1, Math.min(10, pref.getInt("alarmRepeatCount", 3)));
+                  startRound();
+              }
+          
+              private void prepareWindow() {
+                  Window window = getWindow();
+                  window.addFlags(
+                          WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                                  | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                                  | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                                  | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+                  );
+                  if (Build.VERSION.SDK_INT >= 27) {
+                      setShowWhenLocked(true);
+                      setTurnScreenOn(true);
+                  }
+              }
+          
+              private void acquireWakeLock() {
+                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                  if (pm != null) {
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TimerAlarmNative:AlarmWakeLock");
+                      wakeLock.acquire(10 * 60 * 1000L);
+                  }
+              }
+          
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER);
+                  root.setPadding(36, 36, 36, 36);
+                  root.setBackgroundColor(0xff070a12);
+          
+                  title = new TextView(this);
+                  title.setText(testMode ? "试听铃声" : "闹钟时间到");
+                  title.setTextColor(0xffffffff);
+                  title.setTextSize(34);
+                  title.setGravity(Gravity.CENTER);
+                  root.addView(title);
+          
+                  roundText = new TextView(this);
+                  roundText.setTextColor(0xff7dd3fc);
+                  roundText.setTextSize(22);
+                  roundText.setGravity(Gravity.CENTER);
+                  roundText.setPadding(0, 28, 0, 34);
+                  root.addView(roundText);
+          
+                  Button stop = new Button(this);
+                  stop.setText("关闭闹钟");
+                  stop.setTextSize(20);
+                  stop.setAllCaps(false);
+                  stop.setOnClickListener(v -> finish());
+                  root.addView(stop);
+          
+                  setContentView(root);
+              }
+          
+              private void startRound() {
+                  round++;
+                  roundText.setText("第 " + round + "/" + totalRounds + " 遍，默认响 5 分钟");
+                  playSound();
+                  handler.removeCallbacks(stopOneRound);
+                  handler.postDelayed(stopOneRound, testMode ? 15 * 1000L : 5 * 60 * 1000L);
+              }
+          
+              private void playSound() {
+                  stopSound();
+                  try {
+                      SharedPreferences pref = getSharedPreferences(AlarmScheduler.PREF, MODE_PRIVATE);
+                      String saved = pref.getString("alarmSoundUri", "");
+                      Uri uri = saved.isEmpty() ? Settings.System.DEFAULT_ALARM_ALERT_URI : Uri.parse(saved);
+                      player = new MediaPlayer();
+                      player.setDataSource(this, uri);
+                      if (Build.VERSION.SDK_INT >= 21) {
+                          player.setAudioAttributes(new AudioAttributes.Builder()
+                                  .setUsage(AudioAttributes.USAGE_ALARM)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                  .build());
+                      }
+                      player.setLooping(true);
+                      player.prepare();
+                      player.start();
+                  } catch (Exception e) {
+                      try {
+                          player = MediaPlayer.create(this, Settings.System.DEFAULT_ALARM_ALERT_URI);
+                          if (player != null) {
+                              player.setLooping(true);
+                              player.start();
+                          }
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+          
+              private void stopSound() {
+                  if (player != null) {
+                      try {
+                          if (player.isPlaying()) player.stop();
+                          player.release();
+                      } catch (Exception ignored) {
+                      }
+                      player = null;
+                  }
+              }
+          
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  handler.removeCallbacksAndMessages(null);
+                  stopSound();
+                  if (wakeLock != null && wakeLock.isHeld()) {
+                      wakeLock.release();
+                  }
+              }
+          }
+          EOF_app_src_main_java_com_trae_timeralarm_AlarmActivity_java
+
+      - name: 安装 Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: 安装 Android 平台
+        shell: bash
+        run: |
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: 构建 APK
+        run: gradle assembleDebug
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: timer-alarm-native-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
