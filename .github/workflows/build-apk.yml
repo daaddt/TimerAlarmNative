@@ -70,8 +70,8 @@ jobs:
                   applicationId "com.trae.timeralarm"
                   minSdk 26
                   targetSdk 35
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 4
+                  versionName "1.3"
               }
           }
           EOF_app_build_gradle
@@ -83,6 +83,7 @@ jobs:
               <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
               <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
               <uses-permission android:name="android.permission.VIBRATE" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -233,12 +234,19 @@ jobs:
           cat > 'app/src/main/java/com/trae/timeralarm/AlarmReceiver.java' <<'EOF_app_src_main_java_com_trae_timeralarm_AlarmReceiver_java'
           package com.trae.timeralarm;
           
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
           import android.content.BroadcastReceiver;
           import android.content.Context;
           import android.content.Intent;
           import android.content.SharedPreferences;
+          import android.os.Build;
           
           public class AlarmReceiver extends BroadcastReceiver {
+              private static final String CHANNEL_ID = "alarm_full_screen";
+          
               @Override
               public void onReceive(Context context, Intent intent) {
                   SharedPreferences pref = context.getSharedPreferences(AlarmScheduler.PREF, Context.MODE_PRIVATE);
@@ -246,13 +254,56 @@ jobs:
           
                   Intent alarmIntent = new Intent(context, AlarmActivity.class);
                   alarmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                  context.startActivity(alarmIntent);
+                  showFullScreenAlarm(context, alarmIntent);
           
                   if (repeatDaily) {
                       AlarmScheduler.schedule(context);
                   } else {
                       pref.edit().putBoolean("alarmEnabled", false).putLong("nextDueAt", 0).apply();
                   }
+              }
+          
+              private void showFullScreenAlarm(Context context, Intent alarmIntent) {
+                  NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (manager == null) return;
+          
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      NotificationChannel channel = new NotificationChannel(
+                              CHANNEL_ID,
+                              "闹钟提醒",
+                              NotificationManager.IMPORTANCE_HIGH
+                      );
+                      channel.setDescription("用于锁屏和后台弹出闹钟提醒");
+                      channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                      channel.enableVibration(true);
+                      manager.createNotificationChannel(channel);
+                  }
+          
+                  PendingIntent fullScreenIntent = PendingIntent.getActivity(
+                          context,
+                          2001,
+                          alarmIntent,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+          
+                  Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                          ? new Notification.Builder(context, CHANNEL_ID)
+                          : new Notification.Builder(context);
+          
+                  Notification notification = builder
+                          .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                          .setContentTitle("闹钟时间到")
+                          .setContentText("点击关闭或查看闹钟")
+                          .setCategory(Notification.CATEGORY_ALARM)
+                          .setPriority(Notification.PRIORITY_MAX)
+                          .setVisibility(Notification.VISIBILITY_PUBLIC)
+                          .setOngoing(true)
+                          .setAutoCancel(false)
+                          .setFullScreenIntent(fullScreenIntent, true)
+                          .setContentIntent(fullScreenIntent)
+                          .build();
+          
+                  manager.notify(1001, notification);
               }
           }
           EOF_app_src_main_java_com_trae_timeralarm_AlarmReceiver_java
@@ -288,11 +339,14 @@ jobs:
           import android.content.SharedPreferences;
           import android.content.pm.PackageManager;
           import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
           import android.os.Handler;
           import android.os.SystemClock;
+          import android.media.RingtoneManager;
           import android.view.Gravity;
           import android.view.View;
           import android.widget.Button;
@@ -306,6 +360,7 @@ jobs:
           
           public class MainActivity extends Activity {
               private static final int PICK_AUDIO = 2001;
+              private static final int PICK_RINGTONE = 2002;
               private final Handler handler = new Handler();
               private SharedPreferences pref;
           
@@ -382,9 +437,14 @@ jobs:
                   root.setPadding(28, 36, 28, 36);
                   scroll.addView(root);
           
-                  title = text("计时器", 34, Color.WHITE);
+                  title = text("计时器 Pro", 34, Color.WHITE);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
                   title.setGravity(Gravity.CENTER_HORIZONTAL);
                   root.addView(title);
+          
+                  TextView subtitle = text("正计时 · 倒计时 · 原生闹钟", 15, Color.rgb(148, 163, 184));
+                  subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.addView(subtitle);
           
                   LinearLayout tabs = row();
                   stopwatchTab = button("正计时");
@@ -471,9 +531,13 @@ jobs:
                   soundName = text("铃声：默认系统闹钟音", 15, Color.LTGRAY);
                   root.addView(soundName);
                   LinearLayout soundRow = row();
-                  Button choose = button("选择音乐文件");
+                  Button chooseSystem = button("系统铃声");
+                  Button choose = button("音乐文件");
+                  Button resetSound = button("默认");
                   Button test = button("试听");
+                  soundRow.addView(chooseSystem, weight());
                   soundRow.addView(choose, weight());
+                  soundRow.addView(resetSound, weight());
                   soundRow.addView(test, weight());
                   root.addView(soundRow);
           
@@ -487,7 +551,12 @@ jobs:
                   alarmRepeatCount.setOnFocusChangeListener((v, hasFocus) -> {
                       if (!hasFocus) saveAndScheduleAlarm();
                   });
+                  chooseSystem.setOnClickListener(v -> chooseSystemRingtone());
                   choose.setOnClickListener(v -> chooseAudio());
+                  resetSound.setOnClickListener(v -> {
+                      pref.edit().remove("alarmSoundUri").putString("alarmSoundType", "default").apply();
+                      soundName.setText("铃声：默认系统闹钟音");
+                  });
                   test.setOnClickListener(v -> {
                       Intent intent = new Intent(this, AlarmActivity.class);
                       intent.putExtra("test", true);
@@ -646,7 +715,14 @@ jobs:
                   }
                   alarmRepeatCount.setText(String.valueOf(pref.getInt("alarmRepeatCount", 3)));
                   String uri = pref.getString("alarmSoundUri", "");
-                  soundName.setText(uri.isEmpty() ? "铃声：默认系统闹钟音" : "铃声：已选择自定义音乐");
+                  String type = pref.getString("alarmSoundType", "default");
+                  if (uri.isEmpty()) {
+                      soundName.setText("铃声：默认系统闹钟音");
+                  } else if ("system".equals(type)) {
+                      soundName.setText("铃声：已选择系统铃声");
+                  } else {
+                      soundName.setText("铃声：已选择音乐文件");
+                  }
                   updateAlarmInfo();
               }
           
@@ -686,14 +762,38 @@ jobs:
                   startActivityForResult(intent, PICK_AUDIO);
               }
           
+              private void chooseSystemRingtone() {
+                  Intent intent = new Intent(RingtoneManager.ACTION_RINGTONE_PICKER);
+                  intent.putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_ALARM);
+                  intent.putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "选择系统闹钟铃声");
+                  intent.putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, false);
+                  intent.putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true);
+                  String saved = pref.getString("alarmSoundUri", "");
+                  if (!saved.isEmpty()) {
+                      intent.putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, Uri.parse(saved));
+                  } else {
+                      intent.putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM));
+                  }
+                  startActivityForResult(intent, PICK_RINGTONE);
+              }
+          
               @Override
               protected void onActivityResult(int requestCode, int resultCode, Intent data) {
                   super.onActivityResult(requestCode, resultCode, data);
                   if (requestCode == PICK_AUDIO && resultCode == RESULT_OK && data != null && data.getData() != null) {
                       Uri uri = data.getData();
                       getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                      pref.edit().putString("alarmSoundUri", uri.toString()).apply();
-                      soundName.setText("铃声：已选择自定义音乐");
+                      pref.edit().putString("alarmSoundUri", uri.toString()).putString("alarmSoundType", "file").apply();
+                      soundName.setText("铃声：已选择音乐文件");
+                  } else if (requestCode == PICK_RINGTONE && resultCode == RESULT_OK && data != null) {
+                      Uri uri = data.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI);
+                      if (uri != null) {
+                          pref.edit().putString("alarmSoundUri", uri.toString()).putString("alarmSoundType", "system").apply();
+                          soundName.setText("铃声：已选择系统铃声");
+                      } else {
+                          pref.edit().remove("alarmSoundUri").putString("alarmSoundType", "default").apply();
+                          soundName.setText("铃声：默认系统闹钟音");
+                      }
                   }
               }
           
@@ -717,6 +817,14 @@ jobs:
                   b.setText(value);
                   b.setTextSize(16);
                   b.setAllCaps(false);
+                  b.setTextColor(Color.WHITE);
+                  GradientDrawable bg = new GradientDrawable(
+                          GradientDrawable.Orientation.LEFT_RIGHT,
+                          new int[]{Color.rgb(14, 165, 233), Color.rgb(16, 185, 129)}
+                  );
+                  bg.setCornerRadius(22);
+                  b.setBackground(bg);
+                  b.setPadding(8, 8, 8, 8);
                   return b;
               }
           
@@ -724,9 +832,16 @@ jobs:
                   EditText e = new EditText(this);
                   e.setText(value);
                   e.setTextColor(Color.WHITE);
+                  e.setHintTextColor(Color.rgb(148, 163, 184));
                   e.setTextSize(18);
                   e.setSelectAllOnFocus(true);
                   e.setGravity(Gravity.CENTER);
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setColor(Color.rgb(15, 23, 42));
+                  bg.setStroke(2, Color.rgb(51, 65, 85));
+                  bg.setCornerRadius(18);
+                  e.setBackground(bg);
+                  e.setPadding(8, 8, 8, 8);
                   return e;
               }
           
@@ -766,14 +881,20 @@ jobs:
           package com.trae.timeralarm;
           
           import android.app.Activity;
+          import android.app.NotificationManager;
+          import android.content.Context;
           import android.content.SharedPreferences;
           import android.media.AudioAttributes;
+          import android.media.AudioManager;
           import android.media.MediaPlayer;
+          import android.media.RingtoneManager;
+          import android.media.ToneGenerator;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
           import android.os.Handler;
           import android.os.PowerManager;
+          import android.os.Vibrator;
           import android.provider.Settings;
           import android.view.Gravity;
           import android.view.Window;
@@ -785,6 +906,8 @@ jobs:
           public class AlarmActivity extends Activity {
               private final Handler handler = new Handler();
               private MediaPlayer player;
+              private ToneGenerator toneGenerator;
+              private Vibrator vibrator;
               private PowerManager.WakeLock wakeLock;
               private int round = 0;
               private int totalRounds = 1;
@@ -812,12 +935,27 @@ jobs:
                   }
               };
           
+              private final Runnable fallbackBeep = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (toneGenerator != null) {
+                          toneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 900);
+                          handler.postDelayed(this, 1400);
+                      }
+                  }
+              };
+          
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+                  NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (manager != null) {
+                      manager.cancel(1001);
+                  }
                   testMode = getIntent().getBooleanExtra("test", false);
                   prepareWindow();
                   acquireWakeLock();
+                  vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
                   buildUi();
                   SharedPreferences pref = getSharedPreferences(AlarmScheduler.PREF, MODE_PRIVATE);
                   totalRounds = testMode ? 1 : Math.max(1, Math.min(10, pref.getInt("alarmRepeatCount", 3)));
@@ -880,6 +1018,7 @@ jobs:
               private void startRound() {
                   round++;
                   roundText.setText("第 " + round + "/" + totalRounds + " 遍，默认响 5 分钟");
+                  vibrateAlarm();
                   playSound();
                   handler.removeCallbacks(stopOneRound);
                   handler.postDelayed(stopOneRound, testMode ? 15 * 1000L : 5 * 60 * 1000L);
@@ -887,10 +1026,26 @@ jobs:
           
               private void playSound() {
                   stopSound();
+                  SharedPreferences pref = getSharedPreferences(AlarmScheduler.PREF, MODE_PRIVATE);
+                  String saved = pref.getString("alarmSoundUri", "");
+                  Uri[] candidates = new Uri[]{
+                          saved.isEmpty() ? null : Uri.parse(saved),
+                          Settings.System.DEFAULT_ALARM_ALERT_URI,
+                          RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM),
+                          RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
+                          RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+                  };
+          
+                  for (Uri uri : candidates) {
+                      if (uri != null && tryPlayUri(uri)) {
+                          return;
+                      }
+                  }
+                  startFallbackBeep();
+              }
+          
+              private boolean tryPlayUri(Uri uri) {
                   try {
-                      SharedPreferences pref = getSharedPreferences(AlarmScheduler.PREF, MODE_PRIVATE);
-                      String saved = pref.getString("alarmSoundUri", "");
-                      Uri uri = saved.isEmpty() ? Settings.System.DEFAULT_ALARM_ALERT_URI : Uri.parse(saved);
                       player = new MediaPlayer();
                       player.setDataSource(this, uri);
                       if (Build.VERSION.SDK_INT >= 21) {
@@ -898,23 +1053,44 @@ jobs:
                                   .setUsage(AudioAttributes.USAGE_ALARM)
                                   .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                                   .build());
+                      } else {
+                          player.setAudioStreamType(AudioManager.STREAM_ALARM);
                       }
                       player.setLooping(true);
                       player.prepare();
                       player.start();
+                      return true;
                   } catch (Exception e) {
-                      try {
-                          player = MediaPlayer.create(this, Settings.System.DEFAULT_ALARM_ALERT_URI);
-                          if (player != null) {
-                              player.setLooping(true);
-                              player.start();
+                      if (player != null) {
+                          try {
+                              player.release();
+                          } catch (Exception ignored) {
                           }
-                      } catch (Exception ignored) {
+                          player = null;
                       }
+                      return false;
+                  }
+              }
+          
+              private void startFallbackBeep() {
+                  try {
+                      toneGenerator = new ToneGenerator(AudioManager.STREAM_ALARM, 100);
+                      fallbackBeep.run();
+                  } catch (Exception ignored) {
+                  }
+              }
+          
+              private void vibrateAlarm() {
+                  if (vibrator == null) return;
+                  try {
+                      long[] pattern = new long[]{0, 700, 300, 700, 300, 700};
+                      vibrator.vibrate(pattern, 0);
+                  } catch (Exception ignored) {
                   }
               }
           
               private void stopSound() {
+                  handler.removeCallbacks(fallbackBeep);
                   if (player != null) {
                       try {
                           if (player.isPlaying()) player.stop();
@@ -922,6 +1098,19 @@ jobs:
                       } catch (Exception ignored) {
                       }
                       player = null;
+                  }
+                  if (toneGenerator != null) {
+                      try {
+                          toneGenerator.release();
+                      } catch (Exception ignored) {
+                      }
+                      toneGenerator = null;
+                  }
+                  if (vibrator != null) {
+                      try {
+                          vibrator.cancel();
+                      } catch (Exception ignored) {
+                      }
                   }
               }
           
